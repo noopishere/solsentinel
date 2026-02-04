@@ -197,4 +197,4 @@ if (require.main === module) {
   main();
 }
 
-export { TwitterCrawler };
+// TwitterCrawler is exported via class declaration above
