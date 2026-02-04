@@ -1,0 +1,22 @@
+[package]
+name = "sol_sentinel"
+version = "0.1.0"
+description = "SolSentinel - Crypto Sentiment Oracle on Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "sol_sentinel"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+
+[dependencies]
+anchor-lang = "0.29.0"
+
+[dev-dependencies]
+anchor-client = "0.29.0"
