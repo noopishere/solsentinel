@@ -61,8 +61,40 @@ export const BEARISH_KEYWORDS = [
 ];
 
 // Common Solana token symbols to track
+// Categories: L1, DeFi, Memecoins, AI Agents, NFT tokens
 export const TRACKED_TOKENS = [
-  'SOL', 'BONK', 'WIF', 'JUP', 'JTO', 'PYTH', 'RAY', 'ORCA',
-  'MNDE', 'SAMO', 'BOME', 'POPCAT', 'MEW', 'MYRO', 'SLERF',
-  'FWOG', 'GOAT', 'AI16Z', 'GRIFFAIN', 'ZEREBRO'
+  // L1 & Major
+  'SOL', 'JTO', 'JUP', 'PYTH', 'HNT', 'RENDER', 'INJ', 'MATIC',
+  
+  // DeFi
+  'RAY', 'ORCA', 'MNDE', 'MARINADE', 'DRIFT', 'KAMINO', 'JITO', 'BLZE',
+  'SRM', 'STEP', 'TULIP', 'SABER', 'PORT', 'UXDC',
+  
+  // Memecoins & Community
+  'BONK', 'WIF', 'SAMO', 'BOME', 'POPCAT', 'MEW', 'MYRO', 'SLERF',
+  'FWOG', 'GOAT', 'PONKE', 'WEN', 'BOOK', 'MUMU', 'TREMP', 'BODEN',
+  'PENG', 'SLOTH', 'HARAMBE', 'CHEEMS', 'COPE', 'GUMMY',
+  
+  // AI Agents & AI Coins
+  'AI16Z', 'GRIFFAIN', 'ZEREBRO', 'ELIZAOS', 'ARC', 'SWARMS',
+  'VIRTUAL', 'AIXBT', 'TAO', 'FET', 'AGIX', 'OCEAN', 'AKT',
+  'NEAR', 'GRASS', 'RENDER', 'RNDR',
+  
+  // NFT & Gaming tokens
+  'DUST', 'FORGE', 'CROWN', 'GMT', 'GST', 'ATLAS', 'POLIS',
+  
+  // Stablecoins (for tracking de-peg sentiment)
+  'USDC', 'USDT', 'DAI', 'FRAX', 'USDH',
+  
+  // Cross-chain & Others
+  'ETH', 'BTC', 'WBTC', 'WETH', 'LDO', 'ARB', 'OP', 'AVAX'
 ];
+
+// Token categories for filtering
+export const TOKEN_CATEGORIES: Record<string, string[]> = {
+  'l1': ['SOL', 'ETH', 'BTC', 'AVAX', 'NEAR', 'INJ'],
+  'defi': ['RAY', 'ORCA', 'MNDE', 'DRIFT', 'KAMINO', 'JITO', 'JUP', 'BLZE'],
+  'memecoin': ['BONK', 'WIF', 'SAMO', 'BOME', 'POPCAT', 'MEW', 'MYRO', 'SLERF', 'FWOG', 'GOAT', 'PONKE', 'WEN'],
+  'ai': ['AI16Z', 'GRIFFAIN', 'ZEREBRO', 'ELIZAOS', 'ARC', 'VIRTUAL', 'TAO', 'FET', 'AGIX'],
+  'stablecoin': ['USDC', 'USDT', 'DAI', 'FRAX', 'USDH']
+};

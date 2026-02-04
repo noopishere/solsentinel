@@ -121,21 +121,65 @@ export class TwitterCrawler {
   }
 
   /**
+   * Reinitialize browser if closed
+   */
+  private async ensureBrowser(): Promise<boolean> {
+    try {
+      // Test if page is still alive
+      if (this.page) {
+        await this.page.evaluate(() => true);
+        return true;
+      }
+    } catch {
+      // Browser/page is dead, reinitialize
+      console.log('  ⚠️ Browser closed, reinitializing...');
+    }
+    
+    try {
+      await this.close();
+      await this.init();
+      return true;
+    } catch (e) {
+      console.error('  Failed to reinitialize browser:', e);
+      return false;
+    }
+  }
+
+  /**
    * Crawl sentiment for tracked tokens
    */
-  async crawlTokens(): Promise<Map<string, any>> {
+  async crawlTokens(tokenLimit: number = 10): Promise<Map<string, any>> {
     const allTweets: Tweet[] = [];
+    const tokensToTrack = TRACKED_TOKENS.slice(0, tokenLimit);
+    let consecutiveErrors = 0;
+    const maxConsecutiveErrors = 3;
 
-    for (const token of TRACKED_TOKENS.slice(0, 10)) { // Limit to top 10 for speed
+    for (const token of tokensToTrack) {
+      // Check if we should stop due to too many errors
+      if (consecutiveErrors >= maxConsecutiveErrors) {
+        console.log(`\n⚠️ Too many consecutive errors, stopping early with ${allTweets.length} tweets`);
+        break;
+      }
+
       try {
+        // Ensure browser is alive
+        if (!await this.ensureBrowser()) {
+          consecutiveErrors++;
+          continue;
+        }
+
         const query = `$${token} (bullish OR bearish OR moon OR dump OR buy OR sell) -is:retweet`;
         const tweets = await this.searchTweets(query, 20);
         allTweets.push(...tweets);
+        consecutiveErrors = 0; // Reset on success
         
-        // Rate limit friendly
-        await this.page?.waitForTimeout(2000);
-      } catch (e) {
-        console.error(`  Error crawling ${token}:`, e);
+        // Rate limit friendly - random delay between 2-4 seconds
+        const delay = 2000 + Math.random() * 2000;
+        await this.page?.waitForTimeout(delay);
+      } catch (e: any) {
+        consecutiveErrors++;
+        const errorMsg = e.message?.slice(0, 100) || String(e);
+        console.error(`  Error crawling ${token}: ${errorMsg}`);
       }
     }
 
