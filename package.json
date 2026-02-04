@@ -8,6 +8,8 @@
     "crawl": "ts-node src/crawler.ts",
     "api": "ts-node src/api.ts",
     "analyze": "ts-node src/analyzer.ts",
+    "mock": "ts-node src/mockData.ts",
+    "mock:history": "ts-node src/mockData.ts --historical 24",
     "test": "jest"
   },
   "keywords": ["solana", "sentiment", "oracle", "ai", "agent"],
