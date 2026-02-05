@@ -597,7 +597,11 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 });
 
 // Start server
-if (require.main === module) {
+const isMain = import.meta.url === `file://${process.argv[1]}` || 
+               process.argv[1]?.endsWith('api.ts') ||
+               !process.argv[1];
+
+if (isMain) {
   app.listen(PORT, () => {
     console.log(`🔮 SolSentinel API running on port ${PORT}`);
     console.log(`\nEndpoints:`);
