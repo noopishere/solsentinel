@@ -250,7 +250,7 @@ pub struct StoreSentiment<'info> {
     pub sentinel: Account<'info, Sentinel>,
 
     #[account(
-        init,
+        init_if_needed,
         payer = authority,
         space = SentimentRecord::LEN,
         seeds = [SENTIMENT_SEED, symbol.as_bytes()],
@@ -303,7 +303,7 @@ pub struct SubscribeToken<'info> {
 #[instruction(symbol: String)]
 pub struct VoteSentiment<'info> {
     #[account(
-        init,
+        init_if_needed,
         payer = user,
         space = CommunityVote::LEN,
         seeds = [b"vote", user.key().as_ref(), symbol.as_bytes()],
