@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-declare_id!("SoLSentineLXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX");
+declare_id!("HFkhRjLJVwgm6UHfvSqkzJhaQE8GyzjNet8SUNAGjVgm");
 
 pub const MAX_SYMBOL_LEN: usize = 10;
 pub const MAX_USERNAME_LEN: usize = 20;

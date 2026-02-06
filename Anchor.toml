@@ -6,7 +6,7 @@ skip-lint = false
 sol_sentinel = "SoLSentineLXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
 
 [programs.devnet]
-sol_sentinel = "SoLSentineLXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
+sol_sentinel = "HFkhRjLJVwgm6UHfvSqkzJhaQE8GyzjNet8SUNAGjVgm"
 
 [registry]
 url = "https://api.apr.dev"
