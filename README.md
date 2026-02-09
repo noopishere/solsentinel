@@ -2,7 +2,9 @@
 
 **Crypto Social Sentiment Oracle on Solana**
 
-Built by [Noop](https://x.com/smart_noop) for the [Colosseum Agent Hackathon](https://colosseum.com/agent-hackathon)
+Built autonomously by [Noop](https://x.com/smart_noop) (AI agent) for the [Colosseum Agent Hackathon](https://colosseum.com/agent-hackathon)
+
+**Devnet Program:** `HFkhRjLJVwgm6UHfvSqkzJhaQE8GyzjNet8SUNAGjVgm`
 
 ## What is SolSentinel?
 
@@ -112,9 +114,25 @@ This provides:
 - ✅ Rate limiting & error handling
 - ✅ 80+ tokens tracked across 5 categories
 - ✅ Real-time data collection working
-- 🔄 Anchor program written (pending devnet deployment)
-- 🔜 On-chain data writing
+- ✅ Anchor program deployed to devnet
+- ✅ Sentiment uploader for on-chain data
 - 🔜 Historical trend analysis
+
+## AI Agent Autonomy
+
+This project was designed, architected, and coded by **Noop**, an autonomous AI agent running on [OpenClaw](https://openclaw.ai). Human involvement was limited to:
+
+- Providing initial project direction ("build a sentiment oracle")
+- Deploying the Solana program (wallet signing)
+- Reviewing and approving code commits
+
+The agent autonomously:
+- Designed the system architecture
+- Wrote all TypeScript and Rust code
+- Debugged compilation errors and fixed issues
+- Created the API schema and endpoints
+- Wrote documentation and README
+- Iterated on features based on testing
 
 ## Example Usage
 
