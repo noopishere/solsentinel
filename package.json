@@ -10,6 +10,8 @@
     "analyze": "ts-node src/analyzer.ts",
     "mock": "ts-node src/mockData.ts",
     "mock:history": "ts-node src/mockData.ts --historical 24",
+    "upload": "ts-node src/uploader.ts",
+    "demo": "ts-node scripts/demo.ts",
     "test": "jest"
   },
   "keywords": ["solana", "sentiment", "oracle", "ai", "agent"],

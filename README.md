@@ -39,14 +39,40 @@ SolSentinel monitors crypto Twitter in real-time, analyzes sentiment around toke
 # Install dependencies
 npm install
 
-# Run the sentiment crawler
-npm run crawl
+# Run the full demo (crawl → analyze → upload → query)
+npm run demo
+
+# Generate test data (if you don't have real Twitter data)
+npm run mock              # Single snapshot
+npm run mock:history      # 24 hours of historical data
 
 # Start the API server
 npm run api
 
-# Test the analyzer
+# Run the sentiment crawler (requires Playwright + Twitter access)
+npm run crawl
+
+# Upload sentiment data on-chain (requires Solana wallet)
+npm run upload
+
+# Test the analyzer standalone
 npm run analyze
+```
+
+### Setting Up Solana (for on-chain uploads)
+
+```bash
+# Install Solana CLI
+sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+
+# Generate a wallet
+solana-keygen new
+
+# Fund it on devnet
+solana airdrop 2 --url devnet
+
+# Upload sentiment data
+npm run upload
 ```
 
 ## API Endpoints
@@ -139,14 +165,37 @@ The agent autonomously:
 ```bash
 # Get SOL sentiment
 curl http://localhost:3000/sentiment/SOL
-# {"token":"SOL","sentiment":32,"confidence":28,"volume":13,"interpretation":"bullish","signal":"hold"}
+# {"token":"SOL","sentiment":70,"confidence":95,"volume":7,"interpretation":"very_bullish","signal":"strong_buy"}
 
 # Get trending tokens
 curl http://localhost:3000/trending?limit=5
 
 # Compare tokens
 curl "http://localhost:3000/compare?tokens=SOL,BTC,BONK"
+
+# Historical sentiment
+curl http://localhost:3000/history/SOL?limit=24
+
+# Filter by category
+curl "http://localhost:3000/sentiment?category=memecoin&sortBy=volume"
+
+# Health check
+curl http://localhost:3000/health
 ```
+
+## Demo
+
+Run the full end-to-end demo to see SolSentinel in action:
+
+```bash
+npm run demo
+```
+
+This simulates the complete flow:
+1. **Crawl** — Collects tweets mentioning crypto tokens
+2. **Analyze** — Scores sentiment using keyword analysis + engagement weighting
+3. **Upload** — Pushes results to Solana PDAs (dry run without wallet)
+4. **Query** — Fetches results from the REST API
 
 ## License
 
