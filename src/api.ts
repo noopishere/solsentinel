@@ -597,7 +597,7 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 });
 
 // Start server
-const isMain = import.meta.url === `file://${process.argv[1]}` || 
+const isMain = require.main === module ||
                process.argv[1]?.endsWith('api.ts') ||
                !process.argv[1];
 
