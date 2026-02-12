@@ -1,109 +1,160 @@
-// REST API for SolSentinel
-// Exposes sentiment data for other agents to query
+// REST API + WebSocket server for SolSentinel
+// Exposes sentiment data for agents, dashboards, and real-time subscribers
 
 import express, { Request, Response, NextFunction } from 'express';
+import * as http from 'http';
 import * as fs from 'fs';
 import * as path from 'path';
-import { TRACKED_TOKENS, TOKEN_CATEGORIES } from './types';
+import { WebSocketServer, WebSocket } from 'ws';
+import {
+  TRACKED_TOKENS,
+  TOKEN_CATEGORIES,
+  SentimentInterpretation,
+  TradingSignal,
+  HealthResponse,
+  TokenSentimentResponse,
+  HistoryPoint,
+  ComparisonEntry,
+  SentimentAlert,
+  AlertSeverity,
+  WSClientMessage,
+  WSServerMessage,
+} from './types';
+
+// ── Config ───────────────────────────────────────────────────────────
+
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const DATA_DIR = process.env.DATA_DIR || '/root/.openclaw/workspace/solsentinel/data';
+const RATE_LIMIT = parseInt(process.env.RATE_LIMIT || '100', 10);
+const RATE_WINDOW_MS = 60_000;
+const CACHE_TTL_MS = 30_000;
+const VERSION = '0.2.0';
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const DATA_DIR = '/root/.openclaw/workspace/solsentinel/data';
+const server = http.createServer(app);
 
-// Simple in-memory rate limiting
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const RATE_LIMIT = 100; // requests per window
-const RATE_WINDOW_MS = 60 * 1000; // 1 minute
+// ── Startup timestamp ────────────────────────────────────────────────
 
-app.use(express.json());
+const startedAt = Date.now();
 
-// CORS for agent access
-app.use((req: Request, res: Response, next: NextFunction) => {
+// ── Rate limiting ────────────────────────────────────────────────────
+
+interface RateLimitRecord {
+  count: number;
+  resetTime: number;
+}
+
+const rateLimitMap = new Map<string, RateLimitRecord>();
+
+// Periodic cleanup to avoid memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, record] of rateLimitMap) {
+    if (now > record.resetTime) rateLimitMap.delete(ip);
+  }
+}, 60_000);
+
+app.use(express.json({ limit: '100kb' }));
+
+// CORS
+app.use((_req: Request, res: Response, next: NextFunction) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, X-API-Key');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
+  if (_req.method === 'OPTIONS') return void res.sendStatus(200);
   next();
 });
 
 // Rate limiting middleware
-function rateLimit(req: Request, res: Response, next: NextFunction) {
+function rateLimit(req: Request, res: Response, next: NextFunction): void {
   const ip = req.ip || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
-  
+
   let record = rateLimitMap.get(ip);
   if (!record || now > record.resetTime) {
     record = { count: 0, resetTime: now + RATE_WINDOW_MS };
     rateLimitMap.set(ip, record);
   }
-  
   record.count++;
-  
-  // Add rate limit headers
+
   res.header('X-RateLimit-Limit', RATE_LIMIT.toString());
   res.header('X-RateLimit-Remaining', Math.max(0, RATE_LIMIT - record.count).toString());
   res.header('X-RateLimit-Reset', Math.ceil(record.resetTime / 1000).toString());
-  
+
   if (record.count > RATE_LIMIT) {
-    return res.status(429).json({
+    res.status(429).json({
       error: 'Too many requests',
       message: 'Rate limit exceeded. Please try again later.',
-      retryAfter: Math.ceil((record.resetTime - now) / 1000)
+      retryAfter: Math.ceil((record.resetTime - now) / 1000),
     });
+    return;
   }
-  
   next();
 }
 
 app.use(rateLimit);
 
-// Request logging middleware
+// Request logging
 app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
   res.on('finish', () => {
-    const duration = Date.now() - start;
-    console.log(`${req.method} ${req.path} ${res.statusCode} ${duration}ms`);
+    console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms`);
   });
   next();
 });
 
-// Error handling wrapper for async routes
-function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any>) {
-  return (req: Request, res: Response, next: NextFunction) => {
+// ── Helpers ──────────────────────────────────────────────────────────
+
+function asyncHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<void>) {
+  return (req: Request, res: Response, next: NextFunction): void => {
     Promise.resolve(fn(req, res, next)).catch(next);
   };
 }
 
-/**
- * Get latest sentiment data with caching
- */
+function isValidToken(token: string): boolean {
+  return /^[A-Z0-9]{1,10}$/.test(token);
+}
+
+function interpretSentiment(score: number): SentimentInterpretation {
+  if (score >= 60) return 'very_bullish';
+  if (score >= 20) return 'bullish';
+  if (score >= -20) return 'neutral';
+  if (score >= -60) return 'bearish';
+  return 'very_bearish';
+}
+
+function generateSignal(sentiment: { score: number; confidence: number; volume: number }): TradingSignal {
+  const { score, confidence, volume } = sentiment;
+  if (confidence < 30 || volume < 3) return 'insufficient_data';
+  if (score >= 60 && confidence >= 60) return 'strong_buy';
+  if (score >= 30 && confidence >= 40) return 'buy';
+  if (score <= -60 && confidence >= 60) return 'strong_sell';
+  if (score <= -30 && confidence >= 40) return 'sell';
+  return 'hold';
+}
+
+function clampInt(val: string | undefined, min: number, max: number, fallback: number): number {
+  if (val === undefined) return fallback;
+  const n = parseInt(val, 10);
+  if (isNaN(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+// ── Data access ──────────────────────────────────────────────────────
+
 let dataCache: { data: any; timestamp: number } | null = null;
-const CACHE_TTL_MS = 30 * 1000; // 30 seconds
 
 function getLatestData(): any {
-  // Check cache
-  if (dataCache && Date.now() - dataCache.timestamp < CACHE_TTL_MS) {
-    return dataCache.data;
-  }
-
-  if (!fs.existsSync(DATA_DIR)) {
-    return null;
-  }
+  if (dataCache && Date.now() - dataCache.timestamp < CACHE_TTL_MS) return dataCache.data;
+  if (!fs.existsSync(DATA_DIR)) return null;
 
   try {
     const files = fs.readdirSync(DATA_DIR)
       .filter(f => f.startsWith('sentiment-') && f.endsWith('.json'))
-      .sort()
-      .reverse();
-
+      .sort().reverse();
     if (files.length === 0) return null;
 
-    const latestFile = path.join(DATA_DIR, files[0]);
-    const data = JSON.parse(fs.readFileSync(latestFile, 'utf-8'));
-    
-    // Update cache
+    const data = JSON.parse(fs.readFileSync(path.join(DATA_DIR, files[0]), 'utf-8'));
     dataCache = { data, timestamp: Date.now() };
     return data;
   } catch (error) {
@@ -112,171 +163,148 @@ function getLatestData(): any {
   }
 }
 
-/**
- * Get historical data (last N files)
- */
 function getHistoricalData(limit: number = 10): any[] {
-  if (!fs.existsSync(DATA_DIR)) {
-    return [];
-  }
-
+  if (!fs.existsSync(DATA_DIR)) return [];
   try {
     const files = fs.readdirSync(DATA_DIR)
       .filter(f => f.startsWith('sentiment-') && f.endsWith('.json'))
-      .sort()
-      .reverse()
-      .slice(0, limit);
-
-    return files.map(f => {
-      const content = fs.readFileSync(path.join(DATA_DIR, f), 'utf-8');
-      return JSON.parse(content);
-    });
+      .sort().reverse().slice(0, limit);
+    return files.map(f => JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), 'utf-8')));
   } catch (error) {
     console.error('Error reading historical data:', error);
     return [];
   }
 }
 
-/**
- * Validate token symbol
- */
-function isValidToken(token: string): boolean {
-  return /^[A-Z0-9]{1,10}$/.test(token);
+function countDataFiles(): number {
+  if (!fs.existsSync(DATA_DIR)) return 0;
+  try {
+    return fs.readdirSync(DATA_DIR).filter(f => f.startsWith('sentiment-') && f.endsWith('.json')).length;
+  } catch { return 0; }
 }
 
-// Health check
-app.get('/health', (req: Request, res: Response) => {
+// ── Routes ───────────────────────────────────────────────────────────
+
+// Health check (enhanced dashboard)
+app.get('/health', (_req: Request, res: Response) => {
   const data = getLatestData();
-  res.json({
-    status: 'ok',
+  const now = Date.now();
+  let dataAge: number | null = null;
+  if (data?.timestamp) {
+    dataAge = Math.round((now - new Date(data.timestamp).getTime()) / 1000);
+  }
+
+  const health: HealthResponse = {
+    status: data ? (dataAge !== null && dataAge < 3600 ? 'ok' : 'degraded') : 'down',
     service: 'solsentinel',
-    version: '0.1.0',
+    version: VERSION,
+    uptime: Math.round((now - startedAt) / 1000),
     dataAvailable: !!data,
     lastUpdate: data?.timestamp || null,
-    trackedTokens: TRACKED_TOKENS.length
-  });
+    dataAge,
+    trackedTokens: TRACKED_TOKENS.length,
+    dataFiles: countDataFiles(),
+    memoryUsage: process.memoryUsage(),
+  };
+  res.json(health);
 });
 
 // Get sentiment for a specific token
 app.get('/sentiment/:token', asyncHandler(async (req: Request, res: Response) => {
   const token = req.params.token.toUpperCase();
-  
-  // Validate token format
-  if (!isValidToken(token)) {
-    return res.status(400).json({
-      error: 'Invalid token',
-      message: 'Token must be 1-10 alphanumeric characters'
-    });
-  }
-  
-  const data = getLatestData();
 
+  if (!isValidToken(token)) {
+    res.status(400).json({ error: 'Invalid token', message: 'Token must be 1-10 alphanumeric characters' });
+    return;
+  }
+
+  const data = getLatestData();
   if (!data) {
-    return res.status(503).json({
-      error: 'Service unavailable',
-      message: 'No sentiment data available. Crawler may not have run yet.'
-    });
+    res.status(503).json({ error: 'Service unavailable', message: 'No sentiment data available. Crawler may not have run yet.' });
+    return;
   }
 
   const sentiment = data.results[token];
   if (!sentiment) {
-    // Token exists in our tracking but no data yet
-    if (TRACKED_TOKENS.includes(token)) {
-      return res.status(404).json({
-        error: 'No data',
-        message: `Token ${token} is tracked but has no sentiment data yet`,
-        isTracked: true
-      });
-    }
-    // Unknown token
-    return res.status(404).json({
-      error: 'Token not found',
-      message: `No data for token ${token}. It may not be tracked.`,
-      isTracked: false,
-      hint: 'Use GET /tokens to see all tracked tokens'
+    const isTracked = TRACKED_TOKENS.includes(token);
+    res.status(404).json({
+      error: isTracked ? 'No data' : 'Token not found',
+      message: isTracked
+        ? `Token ${token} is tracked but has no sentiment data yet`
+        : `No data for token ${token}. It may not be tracked.`,
+      isTracked,
+      hint: isTracked ? undefined : 'Use GET /tokens to see all tracked tokens',
     });
+    return;
   }
 
-  res.json({
+  const resp: TokenSentimentResponse = {
     token,
     sentiment: sentiment.score,
     confidence: sentiment.confidence,
     volume: sentiment.volume,
     timestamp: data.timestamp,
     interpretation: interpretSentiment(sentiment.score),
-    signal: generateSignal(sentiment)
-  });
+    signal: generateSignal(sentiment),
+    signals: sentiment.signals,
+  };
+  res.json(resp);
 }));
 
-// Get all available sentiment data
+// Get all sentiment data with filtering & sorting
 app.get('/sentiment', asyncHandler(async (req: Request, res: Response) => {
   const category = (req.query.category as string)?.toLowerCase();
-  const minVolume = parseInt(req.query.minVolume as string) || 0;
-  const minConfidence = parseInt(req.query.minConfidence as string) || 0;
+  const minVolume = clampInt(req.query.minVolume as string, 0, 100000, 0);
+  const minConfidence = clampInt(req.query.minConfidence as string, 0, 100, 0);
   const sortBy = (req.query.sortBy as string) || 'volume';
   const order = (req.query.order as string) || 'desc';
-  
-  const data = getLatestData();
+  const limit = clampInt(req.query.limit as string, 1, 200, 200);
 
+  const data = getLatestData();
   if (!data) {
-    return res.status(503).json({
-      error: 'Service unavailable',
-      message: 'No sentiment data available. Crawler may not have run yet.'
-    });
+    res.status(503).json({ error: 'Service unavailable', message: 'No sentiment data available.' });
+    return;
   }
 
-  let results = Object.entries(data.results).map(([token, s]: [string, any]) => ({
+  let results: TokenSentimentResponse[] = Object.entries(data.results).map(([token, s]: [string, any]) => ({
     token,
     sentiment: s.score,
     confidence: s.confidence,
     volume: s.volume,
+    timestamp: data.timestamp,
     interpretation: interpretSentiment(s.score),
-    signal: generateSignal(s)
+    signal: generateSignal(s),
   }));
 
-  // Filter by category
+  // Filters
   if (category && TOKEN_CATEGORIES[category]) {
-    const categoryTokens = TOKEN_CATEGORIES[category];
-    results = results.filter(r => categoryTokens.includes(r.token));
+    const cats = TOKEN_CATEGORIES[category];
+    results = results.filter(r => cats.includes(r.token));
+  } else if (category && !TOKEN_CATEGORIES[category]) {
+    res.status(400).json({ error: 'Invalid category', availableCategories: Object.keys(TOKEN_CATEGORIES) });
+    return;
   }
-
-  // Filter by minimum volume
-  if (minVolume > 0) {
-    results = results.filter(r => r.volume >= minVolume);
-  }
-
-  // Filter by minimum confidence
-  if (minConfidence > 0) {
-    results = results.filter(r => r.confidence >= minConfidence);
-  }
+  if (minVolume > 0) results = results.filter(r => r.volume >= minVolume);
+  if (minConfidence > 0) results = results.filter(r => r.confidence >= minConfidence);
 
   // Sort
-  const sortKey = sortBy === 'sentiment' ? 'sentiment' : sortBy === 'confidence' ? 'confidence' : 'volume';
+  const key = sortBy === 'sentiment' ? 'sentiment' : sortBy === 'confidence' ? 'confidence' : 'volume';
   results.sort((a: any, b: any) => {
-    const aVal = sortKey === 'sentiment' ? Math.abs(a[sortKey]) : a[sortKey];
-    const bVal = sortKey === 'sentiment' ? Math.abs(b[sortKey]) : b[sortKey];
-    return order === 'asc' ? aVal - bVal : bVal - aVal;
+    const av = key === 'sentiment' ? Math.abs(a[key]) : a[key];
+    const bv = key === 'sentiment' ? Math.abs(b[key]) : b[key];
+    return order === 'asc' ? av - bv : bv - av;
   });
 
-  res.json({
-    timestamp: data.timestamp,
-    count: results.length,
-    filters: { category, minVolume, minConfidence },
-    tokens: results
-  });
+  results = results.slice(0, limit);
+
+  res.json({ timestamp: data.timestamp, count: results.length, filters: { category, minVolume, minConfidence }, tokens: results });
 }));
 
-// Get trending tokens
+// Trending tokens
 app.get('/trending', asyncHandler(async (req: Request, res: Response) => {
-  const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
+  const limit = clampInt(req.query.limit as string, 1, 50, 10);
   const data = getLatestData();
-
-  if (!data) {
-    return res.status(503).json({
-      error: 'Service unavailable',
-      message: 'No sentiment data available.'
-    });
-  }
+  if (!data) { res.status(503).json({ error: 'Service unavailable' }); return; }
 
   const results = Object.entries(data.results)
     .map(([token, s]: [string, any]) => ({
@@ -284,7 +312,7 @@ app.get('/trending', asyncHandler(async (req: Request, res: Response) => {
       sentiment: s.score,
       volume: s.volume,
       confidence: s.confidence,
-      trendScore: Math.abs(s.score) * Math.log(s.volume + 1) * (s.confidence / 100)
+      trendScore: Math.abs(s.score) * Math.log(s.volume + 1) * (s.confidence / 100),
     }))
     .filter(t => t.volume > 0)
     .sort((a, b) => b.trendScore - a.trendScore)
@@ -297,27 +325,26 @@ app.get('/trending', asyncHandler(async (req: Request, res: Response) => {
       sentiment: t.sentiment,
       volume: t.volume,
       confidence: t.confidence,
-      interpretation: interpretSentiment(t.sentiment)
-    }))
+      interpretation: interpretSentiment(t.sentiment),
+    })),
   });
 }));
 
-// Get sentiment alerts (significant moves)
+// Alerts
 app.get('/alerts', asyncHandler(async (req: Request, res: Response) => {
-  const severityFilter = req.query.severity as string;
-  const data = getLatestData();
-
-  if (!data) {
-    return res.status(503).json({
-      error: 'Service unavailable',
-      message: 'No sentiment data available.'
-    });
+  const severityFilter = req.query.severity as string | undefined;
+  if (severityFilter && !['low', 'medium', 'high'].includes(severityFilter)) {
+    res.status(400).json({ error: 'Invalid severity', allowed: ['low', 'medium', 'high'] });
+    return;
   }
 
-  let alerts = Object.entries(data.results)
-    .filter(([_, s]: [string, any]) => Math.abs(s.score) > 50 && s.confidence > 50)
+  const data = getLatestData();
+  if (!data) { res.status(503).json({ error: 'Service unavailable' }); return; }
+
+  let alerts: SentimentAlert[] = Object.entries(data.results)
+    .filter(([, s]: [string, any]) => Math.abs(s.score) > 50 && s.confidence > 50)
     .map(([token, s]: [string, any]) => {
-      const severity = Math.abs(s.score) > 80 ? 'high' : Math.abs(s.score) > 65 ? 'medium' : 'low';
+      const severity: AlertSeverity = Math.abs(s.score) > 80 ? 'high' : Math.abs(s.score) > 65 ? 'medium' : 'low';
       return {
         token,
         type: s.score > 50 ? 'bullish_surge' : 'bearish_dump',
@@ -325,297 +352,313 @@ app.get('/alerts', asyncHandler(async (req: Request, res: Response) => {
         sentiment: s.score,
         confidence: s.confidence,
         volume: s.volume,
-        message: s.score > 50 
+        message: s.score > 50
           ? `Strong bullish sentiment for ${token} (+${s.score})`
-          : `Strong bearish sentiment for ${token} (${s.score})`
-      };
+          : `Strong bearish sentiment for ${token} (${s.score})`,
+        timestamp: new Date(data.timestamp),
+      } as SentimentAlert;
     });
 
-  // Filter by severity if specified
-  if (severityFilter && ['low', 'medium', 'high'].includes(severityFilter)) {
-    alerts = alerts.filter(a => a.severity === severityFilter);
-  }
+  if (severityFilter) alerts = alerts.filter(a => a.severity === severityFilter);
 
-  // Sort by severity then by absolute sentiment
   const severityOrder: Record<string, number> = { high: 3, medium: 2, low: 1 };
   alerts.sort((a, b) => {
-    const severityDiff = severityOrder[b.severity] - severityOrder[a.severity];
-    if (severityDiff !== 0) return severityDiff;
-    return Math.abs(b.sentiment) - Math.abs(a.sentiment);
+    const d = severityOrder[b.severity] - severityOrder[a.severity];
+    return d !== 0 ? d : Math.abs(b.sentiment) - Math.abs(a.sentiment);
   });
 
-  res.json({
-    timestamp: data.timestamp,
-    alertCount: alerts.length,
-    alerts
-  });
+  res.json({ timestamp: data.timestamp, alertCount: alerts.length, alerts });
 }));
 
-// Get list of all tracked tokens
+// Token list
 app.get('/tokens', (req: Request, res: Response) => {
   const category = (req.query.category as string)?.toLowerCase();
-  
   if (category) {
     if (!TOKEN_CATEGORIES[category]) {
-      return res.status(400).json({
-        error: 'Invalid category',
-        message: `Category '${category}' not found`,
-        availableCategories: Object.keys(TOKEN_CATEGORIES)
-      });
+      res.status(400).json({ error: 'Invalid category', availableCategories: Object.keys(TOKEN_CATEGORIES) });
+      return;
     }
-    return res.json({
-      category,
-      tokens: TOKEN_CATEGORIES[category],
-      count: TOKEN_CATEGORIES[category].length
-    });
+    res.json({ category, tokens: TOKEN_CATEGORIES[category], count: TOKEN_CATEGORIES[category].length });
+    return;
+  }
+  res.json({ total: TRACKED_TOKENS.length, categories: Object.keys(TOKEN_CATEGORIES), tokens: TRACKED_TOKENS });
+});
+
+// Categories
+app.get('/categories', (_req: Request, res: Response) => {
+  const categories = Object.entries(TOKEN_CATEGORIES).map(([name, tokens]) => ({ name, count: tokens.length, tokens }));
+  res.json({ count: categories.length, categories });
+});
+
+// Search tokens (new endpoint)
+app.get('/search', (req: Request, res: Response) => {
+  const q = (req.query.q as string || '').toUpperCase().trim();
+  if (!q || q.length < 1) {
+    res.status(400).json({ error: 'Missing query', message: 'Provide ?q=<search term>' });
+    return;
   }
 
-  res.json({
-    total: TRACKED_TOKENS.length,
-    categories: Object.keys(TOKEN_CATEGORIES),
-    tokens: TRACKED_TOKENS
+  const matched = TRACKED_TOKENS.filter(t => t.includes(q));
+  const data = getLatestData();
+
+  const results = matched.map(token => {
+    const s = data?.results?.[token];
+    return {
+      token,
+      hasData: !!s,
+      sentiment: s?.score ?? null,
+      confidence: s?.confidence ?? null,
+      volume: s?.volume ?? null,
+      category: Object.entries(TOKEN_CATEGORIES).find(([, tokens]) => tokens.includes(token))?.[0] ?? null,
+    };
   });
+
+  res.json({ query: q, count: results.length, results });
 });
 
-// Get token categories
-app.get('/categories', (req: Request, res: Response) => {
-  const categories = Object.entries(TOKEN_CATEGORIES).map(([name, tokens]) => ({
-    name,
-    count: tokens.length,
-    tokens
-  }));
-
-  res.json({
-    count: categories.length,
-    categories
-  });
-});
-
-// Get historical sentiment for a token
+// Historical sentiment for a token
 app.get('/history/:token', asyncHandler(async (req: Request, res: Response) => {
   const token = req.params.token.toUpperCase();
-  const limit = Math.min(parseInt(req.query.limit as string) || 24, 100);
-  
+  const limit = clampInt(req.query.limit as string, 1, 200, 24);
+
   if (!isValidToken(token)) {
-    return res.status(400).json({
-      error: 'Invalid token',
-      message: 'Token must be 1-10 alphanumeric characters'
-    });
+    res.status(400).json({ error: 'Invalid token' });
+    return;
   }
 
   const historical = getHistoricalData(limit);
-  
   if (historical.length === 0) {
-    return res.status(503).json({
-      error: 'Service unavailable',
-      message: 'No historical data available.'
-    });
+    res.status(503).json({ error: 'Service unavailable', message: 'No historical data available.' });
+    return;
   }
 
-  const history = historical
+  const history: HistoryPoint[] = historical
     .map(data => {
-      const sentiment = data.results[token];
-      if (!sentiment) return null;
-      return {
-        timestamp: data.timestamp,
-        sentiment: sentiment.score,
-        confidence: sentiment.confidence,
-        volume: sentiment.volume
-      };
+      const s = data.results[token];
+      if (!s) return null;
+      return { timestamp: data.timestamp, sentiment: s.score, confidence: s.confidence, volume: s.volume };
     })
-    .filter(h => h !== null)
-    .reverse(); // Oldest first
+    .filter((h): h is HistoryPoint => h !== null)
+    .reverse();
 
   if (history.length === 0) {
-    return res.status(404).json({
-      error: 'No history',
-      message: `No historical data for token ${token}`
-    });
+    res.status(404).json({ error: 'No history', message: `No historical data for token ${token}` });
+    return;
   }
 
-  res.json({
-    token,
-    dataPoints: history.length,
-    history
-  });
+  // Compute simple stats
+  const scores = history.map(h => h.sentiment);
+  const avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+  const min = Math.min(...scores);
+  const max = Math.max(...scores);
+
+  res.json({ token, dataPoints: history.length, stats: { avg, min, max }, history });
 }));
 
 // Compare multiple tokens
 app.get('/compare', asyncHandler(async (req: Request, res: Response) => {
   const tokensParam = req.query.tokens as string;
-  
   if (!tokensParam) {
-    return res.status(400).json({
-      error: 'Missing parameter',
-      message: 'Provide tokens as comma-separated list: ?tokens=SOL,BONK,WIF'
-    });
+    res.status(400).json({ error: 'Missing parameter', message: 'Provide tokens as comma-separated list: ?tokens=SOL,BONK,WIF' });
+    return;
   }
 
-  const tokens = tokensParam.split(',').map(t => t.trim().toUpperCase()).slice(0, 10);
-  
-  for (const token of tokens) {
-    if (!isValidToken(token)) {
-      return res.status(400).json({
-        error: 'Invalid token',
-        message: `Invalid token format: ${token}`
-      });
+  const tokens = tokensParam.split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 10);
+  for (const t of tokens) {
+    if (!isValidToken(t)) {
+      res.status(400).json({ error: 'Invalid token', message: `Invalid token format: ${t}` });
+      return;
     }
   }
 
   const data = getLatestData();
-  
-  if (!data) {
-    return res.status(503).json({
-      error: 'Service unavailable',
-      message: 'No sentiment data available.'
-    });
-  }
+  if (!data) { res.status(503).json({ error: 'Service unavailable' }); return; }
 
-  const comparison = tokens.map(token => {
+  const comparison: ComparisonEntry[] = tokens.map(token => {
     const s = data.results[token];
-    if (!s) {
-      return { token, available: false };
-    }
+    if (!s) return { token, available: false };
     return {
-      token,
-      available: true,
-      sentiment: s.score,
-      confidence: s.confidence,
-      volume: s.volume,
-      interpretation: interpretSentiment(s.score)
+      token, available: true,
+      sentiment: s.score, confidence: s.confidence, volume: s.volume,
+      interpretation: interpretSentiment(s.score),
     };
   });
 
-  res.json({
-    timestamp: data.timestamp,
-    comparison
-  });
+  res.json({ timestamp: data.timestamp, comparison });
 }));
 
 // Skill spec for other agents
-app.get('/skill.md', (req: Request, res: Response) => {
-  res.type('text/markdown').send(`# SolSentinel API
+app.get('/skill.md', (_req: Request, res: Response) => {
+  res.type('text/markdown').send(`# SolSentinel API v${VERSION}
 
 Crypto Social Sentiment Oracle on Solana.
 
 ## Base URL
-\`http://localhost:${PORT}\` (local) or deployed URL
+\`http://localhost:${PORT}\`
 
 ## Endpoints
 
-### GET /health
-Health check with service status.
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | /health | Health dashboard with uptime & memory |
+| GET | /sentiment/:token | Sentiment for one token |
+| GET | /sentiment | All sentiment (filterable) |
+| GET | /trending?limit=10 | Trending tokens |
+| GET | /alerts?severity=high | Sentiment alerts |
+| GET | /tokens?category=memecoin | Tracked token list |
+| GET | /categories | Token categories |
+| GET | /search?q=BON | Search tokens |
+| GET | /history/:token?limit=24 | Historical sentiment + stats |
+| GET | /compare?tokens=SOL,BONK | Compare tokens side-by-side |
+| WS  | ws://localhost:${PORT}/ws | Real-time sentiment stream |
 
-### GET /sentiment/:token
-Get sentiment for a specific token.
-- Returns: sentiment score, confidence, volume, interpretation
-
-### GET /sentiment
-Get all available sentiment data.
-- Query params: \`category\`, \`minVolume\`, \`minConfidence\`, \`sortBy\`, \`order\`
-
-### GET /trending?limit=10
-Get trending tokens by sentiment activity.
-
-### GET /alerts?severity=high
-Get significant sentiment alerts.
-- Query params: \`severity\` (low, medium, high)
-
-### GET /tokens?category=memecoin
-List all tracked tokens.
-
-### GET /categories
-Get all token categories with their tokens.
-
-### GET /history/:token?limit=24
-Get historical sentiment data for a token.
-
-### GET /compare?tokens=SOL,BONK,WIF
-Compare sentiment across multiple tokens.
-
-## Interpretation
-
-- **sentiment**: -100 (very bearish) to +100 (very bullish)
-- **confidence**: 0-100, based on keyword matches and engagement
-- **volume**: Number of tweets analyzed
-- **interpretation**: "very_bullish", "bullish", "neutral", "bearish", "very_bearish"
-- **signal**: "strong_buy", "buy", "hold", "sell", "strong_sell"
+## WebSocket
+Connect to \`/ws\`, send JSON:
+\`\`\`json
+{"type":"subscribe","tokens":["SOL","BONK"]}
+{"type":"unsubscribe","tokens":["SOL"]}
+{"type":"ping"}
+\`\`\`
 
 ## Rate Limits
-- 100 requests per minute per IP
-- Rate limit headers included in responses
+${RATE_LIMIT} requests/minute per IP. Headers: X-RateLimit-{Limit,Remaining,Reset}.
 
-## Token Categories
-- \`l1\`: Layer 1 tokens (SOL, ETH, BTC...)
-- \`defi\`: DeFi protocols (RAY, ORCA, JUP...)
-- \`memecoin\`: Meme tokens (BONK, WIF, POPCAT...)
-- \`ai\`: AI Agent tokens (AI16Z, ZEREBRO...)
-- \`stablecoin\`: Stablecoins (USDC, USDT...)
-
-Built by Noop (@smart_noop) for the Colosseum Agent Hackathon.
+Built by Noop (@smart_noop).
 `);
 });
 
-// Helper: Interpret sentiment score
-function interpretSentiment(score: number): string {
-  if (score >= 60) return 'very_bullish';
-  if (score >= 20) return 'bullish';
-  if (score >= -20) return 'neutral';
-  if (score >= -60) return 'bearish';
-  return 'very_bearish';
-}
-
-// Helper: Generate trading signal
-function generateSignal(sentiment: any): string {
-  const { score, confidence, volume } = sentiment;
-  
-  if (confidence < 30 || volume < 3) return 'insufficient_data';
-  
-  if (score >= 60 && confidence >= 60) return 'strong_buy';
-  if (score >= 30 && confidence >= 40) return 'buy';
-  if (score <= -60 && confidence >= 60) return 'strong_sell';
-  if (score <= -30 && confidence >= 40) return 'sell';
-  return 'hold';
-}
-
-// 404 handler
+// 404
 app.use((req: Request, res: Response) => {
   res.status(404).json({
     error: 'Not found',
     message: `Endpoint ${req.method} ${req.path} not found`,
-    hint: 'Use GET /health to check service status or GET /skill.md for API documentation'
+    hint: 'GET /health or GET /skill.md',
   });
 });
 
 // Global error handler
-app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
   console.error('Unhandled error:', err);
   res.status(500).json({
     error: 'Internal server error',
-    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong'
+    message: process.env.NODE_ENV === 'development' ? err.message : 'Something went wrong',
   });
 });
 
-// Start server
+// ── WebSocket server ─────────────────────────────────────────────────
+
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+interface WSClient {
+  ws: WebSocket;
+  subscriptions: Set<string>;
+}
+
+const wsClients = new Map<WebSocket, WSClient>();
+
+wss.on('connection', (ws: WebSocket) => {
+  const client: WSClient = { ws, subscriptions: new Set() };
+  wsClients.set(ws, client);
+  console.log(`WS client connected (total: ${wsClients.size})`);
+
+  ws.on('message', (raw: Buffer) => {
+    try {
+      const msg: WSClientMessage = JSON.parse(raw.toString());
+
+      if (msg.type === 'ping') {
+        sendWS(ws, { type: 'pong', timestamp: new Date().toISOString() });
+        return;
+      }
+
+      if (msg.type === 'subscribe' && Array.isArray(msg.tokens)) {
+        const tokens = msg.tokens.map(t => t.toUpperCase()).filter(isValidToken).slice(0, 50);
+        for (const t of tokens) client.subscriptions.add(t);
+        sendWS(ws, { type: 'subscribed', data: { tokens: [...client.subscriptions] }, timestamp: new Date().toISOString() });
+        return;
+      }
+
+      if (msg.type === 'unsubscribe' && Array.isArray(msg.tokens)) {
+        for (const t of msg.tokens) client.subscriptions.delete(t.toUpperCase());
+        sendWS(ws, { type: 'unsubscribed', data: { tokens: [...client.subscriptions] }, timestamp: new Date().toISOString() });
+        return;
+      }
+
+      sendWS(ws, { type: 'error', data: { message: 'Unknown message type' }, timestamp: new Date().toISOString() });
+    } catch {
+      sendWS(ws, { type: 'error', data: { message: 'Invalid JSON' }, timestamp: new Date().toISOString() });
+    }
+  });
+
+  ws.on('close', () => {
+    wsClients.delete(ws);
+    console.log(`WS client disconnected (total: ${wsClients.size})`);
+  });
+});
+
+function sendWS(ws: WebSocket, msg: WSServerMessage): void {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+/** Broadcast sentiment updates to subscribed WS clients */
+function broadcastSentimentUpdate(token: string, data: any): void {
+  const msg: WSServerMessage = {
+    type: 'sentiment_update',
+    data: { token, ...data },
+    timestamp: new Date().toISOString(),
+  };
+  const payload = JSON.stringify(msg);
+
+  for (const client of wsClients.values()) {
+    if (client.subscriptions.has(token) && client.ws.readyState === WebSocket.OPEN) {
+      client.ws.send(payload);
+    }
+  }
+}
+
+// Periodic broadcast of latest data to WS subscribers (every 30s)
+let lastBroadcastTimestamp: string | null = null;
+
+setInterval(() => {
+  const data = getLatestData();
+  if (!data || data.timestamp === lastBroadcastTimestamp) return;
+  lastBroadcastTimestamp = data.timestamp;
+
+  for (const [token, sentiment] of Object.entries(data.results) as [string, any][]) {
+    broadcastSentimentUpdate(token, {
+      sentiment: sentiment.score,
+      confidence: sentiment.confidence,
+      volume: sentiment.volume,
+      interpretation: interpretSentiment(sentiment.score),
+    });
+  }
+}, 30_000);
+
+// ── Start ────────────────────────────────────────────────────────────
+
 const isMain = require.main === module ||
-               process.argv[1]?.endsWith('api.ts') ||
-               !process.argv[1];
+  process.argv[1]?.endsWith('api.ts') ||
+  !process.argv[1];
 
 if (isMain) {
-  app.listen(PORT, () => {
-    console.log(`🔮 SolSentinel API running on port ${PORT}`);
+  server.listen(PORT, () => {
+    console.log(`🔮 SolSentinel API v${VERSION} running on port ${PORT}`);
+    console.log(`   WebSocket: ws://localhost:${PORT}/ws`);
     console.log(`\nEndpoints:`);
-    console.log(`  GET /health          - Health check`);
-    console.log(`  GET /sentiment/:token - Get token sentiment`);
-    console.log(`  GET /sentiment       - Get all sentiment data`);
-    console.log(`  GET /trending        - Get trending tokens`);
-    console.log(`  GET /alerts          - Get sentiment alerts`);
-    console.log(`  GET /tokens          - List tracked tokens`);
-    console.log(`  GET /categories      - List token categories`);
-    console.log(`  GET /history/:token  - Get historical data`);
-    console.log(`  GET /compare         - Compare multiple tokens`);
-    console.log(`  GET /skill.md        - API spec for agents`);
+    console.log(`  GET  /health           - Health dashboard`);
+    console.log(`  GET  /sentiment/:token  - Token sentiment`);
+    console.log(`  GET  /sentiment         - All sentiment`);
+    console.log(`  GET  /trending          - Trending tokens`);
+    console.log(`  GET  /alerts            - Sentiment alerts`);
+    console.log(`  GET  /tokens            - Tracked tokens`);
+    console.log(`  GET  /categories        - Token categories`);
+    console.log(`  GET  /search?q=         - Search tokens`);
+    console.log(`  GET  /history/:token    - Historical data`);
+    console.log(`  GET  /compare           - Compare tokens`);
+    console.log(`  GET  /skill.md          - API spec`);
+    console.log(`  WS   /ws               - Real-time stream`);
   });
 }
 
-export { app };
+export { app, server, broadcastSentimentUpdate };

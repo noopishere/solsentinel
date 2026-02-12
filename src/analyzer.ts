@@ -1,265 +1,362 @@
 // Sentiment Analysis Engine for SolSentinel
+// Multi-signal analysis with negation detection, emoji weighting, momentum, and virality
 
-import { 
-  Tweet, 
-  SentimentScore, 
+import {
+  Tweet,
+  SentimentScore,
+  SentimentSignals,
   TrendingToken,
-  BULLISH_KEYWORDS, 
+  BULLISH_KEYWORDS,
   BEARISH_KEYWORDS,
-  TRACKED_TOKENS
+  NEGATION_WORDS,
+  HIGH_CONVICTION_BULLISH,
+  HIGH_CONVICTION_BEARISH,
+  TRACKED_TOKENS,
 } from './types';
+
+/** Window size (in words) to check for negation before a keyword */
+const NEGATION_WINDOW = 3;
 
 export class SentimentAnalyzer {
   private tweetCache: Map<string, Tweet[]> = new Map();
   private sentimentHistory: Map<string, SentimentScore[]> = new Map();
 
-  /**
-   * Extract token symbols from tweet text
-   */
+  // ── Token extraction ─────────────────────────────────────────────
+
+  /** Extract token symbols from tweet text */
   extractTokens(text: string): string[] {
     const tokens: string[] = [];
     const upperText = text.toUpperCase();
-    
-    // Check for $SYMBOL format
+
+    // $SYMBOL cashtag format
     const cashtagRegex = /\$([A-Z]{2,10})/g;
-    let match;
+    let match: RegExpExecArray | null;
     while ((match = cashtagRegex.exec(upperText)) !== null) {
       tokens.push(match[1]);
     }
-    
-    // Check for tracked tokens mentioned without $
+
+    // Tracked tokens mentioned without $
     for (const token of TRACKED_TOKENS) {
       if (upperText.includes(token) && !tokens.includes(token)) {
-        tokens.push(token);
+        // Avoid false matches for short tokens inside larger words
+        const re = new RegExp(`\\b${token}\\b`, 'i');
+        if (re.test(text)) {
+          tokens.push(token);
+        }
       }
     }
-    
+
     return [...new Set(tokens)];
   }
 
-  /**
-   * Calculate sentiment score for a single tweet
-   */
-  analyzeTweet(tweet: Tweet): { score: number; confidence: number } {
-    const text = tweet.text.toLowerCase();
-    let bullishCount = 0;
-    let bearishCount = 0;
-    
-    // Count keyword matches
-    for (const keyword of BULLISH_KEYWORDS) {
-      if (text.includes(keyword.toLowerCase())) {
-        bullishCount++;
-      }
-    }
-    
-    for (const keyword of BEARISH_KEYWORDS) {
-      if (text.includes(keyword.toLowerCase())) {
-        bearishCount++;
-      }
-    }
-    
-    // Calculate raw score (-100 to +100)
-    const total = bullishCount + bearishCount;
-    let score = 0;
-    let confidence = 0;
-    
-    if (total > 0) {
-      score = ((bullishCount - bearishCount) / total) * 100;
-      confidence = Math.min(total * 20, 100);  // More keywords = higher confidence
-    }
-    
-    // Weight by engagement (likes, retweets) and follower count
-    const engagementMultiplier = Math.min(
-      1 + (tweet.likes + tweet.retweets * 2) / 1000,
-      3  // Cap at 3x
-    );
-    
-    const followerMultiplier = Math.min(
-      1 + tweet.authorFollowers / 100000,
-      2  // Cap at 2x
-    );
-    
-    confidence = Math.min(confidence * engagementMultiplier * followerMultiplier, 100);
-    
-    return { score, confidence };
-  }
+  // ── Single-tweet analysis ────────────────────────────────────────
 
   /**
-   * Aggregate sentiment for a token from multiple tweets
+   * Check whether a keyword hit at `position` is preceded by a negation word.
+   * `words` is the lowercased word array of the tweet.
    */
+  private isNegated(words: string[], position: number): boolean {
+    const start = Math.max(0, position - NEGATION_WINDOW);
+    for (let i = start; i < position; i++) {
+      if (NEGATION_WORDS.includes(words[i])) return true;
+    }
+    return false;
+  }
+
+  /** Score a single tweet, returning a breakdown of signals */
+  analyzeTweet(tweet: Tweet): { score: number; confidence: number; signals: SentimentSignals } {
+    const text = tweet.text.toLowerCase();
+    const words = text.split(/\s+/);
+
+    // ── 1. Keyword score ──
+    let bullishHits = 0;
+    let bearishHits = 0;
+
+    for (const keyword of BULLISH_KEYWORDS) {
+      const kw = keyword.toLowerCase();
+      const idx = words.indexOf(kw);
+      if (idx !== -1 || text.includes(kw)) {
+        const pos = idx !== -1 ? idx : words.findIndex(w => w.includes(kw));
+        if (pos !== -1 && this.isNegated(words, pos)) {
+          bearishHits += 0.5;   // negated bullish → mild bearish
+        } else {
+          bullishHits++;
+        }
+      }
+    }
+
+    for (const keyword of BEARISH_KEYWORDS) {
+      const kw = keyword.toLowerCase();
+      const idx = words.indexOf(kw);
+      if (idx !== -1 || text.includes(kw)) {
+        const pos = idx !== -1 ? idx : words.findIndex(w => w.includes(kw));
+        if (pos !== -1 && this.isNegated(words, pos)) {
+          bullishHits += 0.5;   // negated bearish → mild bullish
+        } else {
+          bearishHits++;
+        }
+      }
+    }
+
+    // High-conviction phrases (extra weight)
+    for (const phrase of HIGH_CONVICTION_BULLISH) {
+      if (text.includes(phrase)) bullishHits += 2;
+    }
+    for (const phrase of HIGH_CONVICTION_BEARISH) {
+      if (text.includes(phrase)) bearishHits += 2;
+    }
+
+    const total = bullishHits + bearishHits;
+    let keywordScore = 0;
+    if (total > 0) {
+      keywordScore = ((bullishHits - bearishHits) / total) * 100;
+    }
+
+    // ── 2. Emoji-specific score ──
+    const bullishEmojis = ['🚀', '📈', '💎', '🔥', '💰', '🤑', '🏆', '✅', '💪', '🌕'];
+    const bearishEmojis = ['📉', '💀', '🔻', '🩸', '⚠️', '🚩', '☠️', '🗑️'];
+    let emojiScore = 0;
+    for (const e of bullishEmojis) {
+      emojiScore += (text.split(e).length - 1) * 10;
+    }
+    for (const e of bearishEmojis) {
+      emojiScore -= (text.split(e).length - 1) * 10;
+    }
+    emojiScore = Math.max(-50, Math.min(50, emojiScore));
+
+    // ── 3. Engagement weighting ──
+    const engagementRaw = tweet.likes + tweet.retweets * 2 + tweet.replies * 0.5;
+    const engagementScore = Math.min(engagementRaw / 500, 3);   // 0-3 multiplier
+
+    // ── 4. Follower weight ──
+    const followerWeight = Math.min(1 + tweet.authorFollowers / 100_000, 2.5);
+
+    // ── 5. Virality bonus — ratio of engagement to follower count ──
+    let viralityBonus = 0;
+    if (tweet.authorFollowers > 0) {
+      const ratio = engagementRaw / tweet.authorFollowers;
+      if (ratio > 0.05) viralityBonus = Math.min(ratio * 100, 20);
+    }
+
+    // ── Combine signals into final score ──
+    const negationAdjustment = 0;   // already applied inline above
+    const rawScore = keywordScore * 0.55 + emojiScore * 0.15 + viralityBonus * (keywordScore > 0 ? 1 : -1) * 0.1;
+    const score = Math.max(-100, Math.min(100, Math.round(rawScore)));
+
+    let confidence = 0;
+    if (total > 0) {
+      confidence = Math.min(total * 18, 100);
+    }
+    confidence = Math.min(confidence * (1 + engagementScore * 0.3) * (followerWeight * 0.6), 100);
+    confidence = Math.round(confidence);
+
+    const signals: SentimentSignals = {
+      keywordScore: Math.round(keywordScore),
+      engagementScore: Math.round(engagementScore * 100) / 100,
+      followerWeight: Math.round(followerWeight * 100) / 100,
+      emojiScore,
+      negationAdjustment,
+      momentumScore: 0,   // set at aggregate level
+      viralityBonus: Math.round(viralityBonus * 100) / 100,
+    };
+
+    return { score, confidence, signals };
+  }
+
+  // ── Aggregate sentiment ──────────────────────────────────────────
+
+  /** Aggregate sentiment for a token from multiple tweets */
   calculateTokenSentiment(token: string, tweets: Tweet[]): SentimentScore {
-    const relevantTweets = tweets.filter(t => t.tokens.includes(token));
-    
-    if (relevantTweets.length === 0) {
+    const relevant = tweets.filter(t => t.tokens.includes(token));
+
+    if (relevant.length === 0) {
       return {
-        token,
-        score: 0,
-        confidence: 0,
-        volume: 0,
-        timestamp: new Date(),
-        sources: []
+        token, score: 0, confidence: 0, volume: 0,
+        timestamp: new Date(), sources: [],
       };
     }
-    
+
     let totalScore = 0;
     let totalWeight = 0;
     const sources: string[] = [];
-    
-    for (const tweet of relevantTweets) {
-      const { score, confidence } = this.analyzeTweet(tweet);
+    let aggregatedSignals: SentimentSignals = {
+      keywordScore: 0, engagementScore: 0, followerWeight: 0,
+      emojiScore: 0, negationAdjustment: 0, momentumScore: 0, viralityBonus: 0,
+    };
+
+    for (const tweet of relevant) {
+      const { score, confidence, signals } = this.analyzeTweet(tweet);
       const weight = confidence / 100;
-      
+
       totalScore += score * weight;
       totalWeight += weight;
       sources.push(tweet.id);
+
+      // Accumulate signal averages
+      for (const key of Object.keys(aggregatedSignals) as (keyof SentimentSignals)[]) {
+        (aggregatedSignals[key] as number) += signals[key] * weight;
+      }
     }
-    
+
     const avgScore = totalWeight > 0 ? totalScore / totalWeight : 0;
-    const avgConfidence = totalWeight > 0 ? (totalWeight / relevantTweets.length) * 100 : 0;
-    
+    const avgConfidence = totalWeight > 0 ? (totalWeight / relevant.length) * 100 : 0;
+
+    // Normalize aggregated signals
+    if (totalWeight > 0) {
+      for (const key of Object.keys(aggregatedSignals) as (keyof SentimentSignals)[]) {
+        (aggregatedSignals[key] as number) = Math.round((aggregatedSignals[key] as number) / totalWeight * 100) / 100;
+      }
+    }
+
+    // ── Momentum: compare to previous score if available ──
+    const history = this.sentimentHistory.get(token);
+    if (history && history.length > 0) {
+      const prev = history[history.length - 1];
+      const delta = avgScore - prev.score;
+      aggregatedSignals.momentumScore = Math.round(delta * 100) / 100;
+    }
+
     return {
       token,
       score: Math.round(avgScore),
       confidence: Math.round(avgConfidence),
-      volume: relevantTweets.length,
+      volume: relevant.length,
       timestamp: new Date(),
-      sources
+      sources,
+      signals: aggregatedSignals,
     };
   }
 
-  /**
-   * Process a batch of tweets and update sentiment
-   */
+  // ── Batch processing ─────────────────────────────────────────────
+
+  /** Process a batch of tweets and update sentiment */
   processTweets(tweets: Tweet[]): Map<string, SentimentScore> {
-    // Extract tokens from tweets
+    // Extract tokens
     for (const tweet of tweets) {
       tweet.tokens = this.extractTokens(tweet.text);
     }
-    
-    // Find all mentioned tokens
+
     const allTokens = new Set<string>();
     for (const tweet of tweets) {
-      for (const token of tweet.tokens) {
-        allTokens.add(token);
-      }
+      for (const token of tweet.tokens) allTokens.add(token);
     }
-    
-    // Calculate sentiment for each token
+
     const results = new Map<string, SentimentScore>();
+
     for (const token of allTokens) {
       const sentiment = this.calculateTokenSentiment(token, tweets);
       results.set(token, sentiment);
-      
-      // Update cache
-      if (!this.tweetCache.has(token)) {
-        this.tweetCache.set(token, []);
-      }
+
+      // Update caches
+      if (!this.tweetCache.has(token)) this.tweetCache.set(token, []);
       this.tweetCache.get(token)!.push(...tweets.filter(t => t.tokens.includes(token)));
-      
-      // Update history
-      if (!this.sentimentHistory.has(token)) {
-        this.sentimentHistory.set(token, []);
-      }
+
+      if (!this.sentimentHistory.has(token)) this.sentimentHistory.set(token, []);
       this.sentimentHistory.get(token)!.push(sentiment);
+
+      // Keep history bounded (last 500 entries per token)
+      const hist = this.sentimentHistory.get(token)!;
+      if (hist.length > 500) hist.splice(0, hist.length - 500);
     }
-    
+
     return results;
   }
 
-  /**
-   * Get trending tokens based on mention volume and sentiment changes
-   */
+  // ── Trending ─────────────────────────────────────────────────────
+
   getTrending(limit: number = 10): TrendingToken[] {
     const trending: TrendingToken[] = [];
-    
+
     for (const [symbol, history] of this.sentimentHistory) {
       if (history.length === 0) continue;
-      
+
       const latest = history[history.length - 1];
       const previous = history.length > 1 ? history[history.length - 2] : latest;
-      
-      const changePercent = previous.score !== 0 
+
+      const changePercent = previous.score !== 0
         ? ((latest.score - previous.score) / Math.abs(previous.score)) * 100
-        : latest.score > 0 ? 100 : -100;
-      
+        : latest.score > 0 ? 100 : latest.score < 0 ? -100 : 0;
+
       trending.push({
         symbol,
         mentions: latest.volume,
         sentimentScore: latest.score,
         changePercent,
-        topTweets: latest.sources.slice(0, 5)
+        topTweets: latest.sources.slice(0, 5),
       });
     }
-    
-    // Sort by absolute change and volume
+
     trending.sort((a, b) => {
       const aScore = Math.abs(a.changePercent) * Math.log(a.mentions + 1);
       const bScore = Math.abs(b.changePercent) * Math.log(b.mentions + 1);
       return bScore - aScore;
     });
-    
+
     return trending.slice(0, limit);
   }
 
-  /**
-   * Get current sentiment for a specific token
-   */
+  /** Get current sentiment for a specific token */
   getSentiment(token: string): SentimentScore | null {
     const history = this.sentimentHistory.get(token.toUpperCase());
     if (!history || history.length === 0) return null;
     return history[history.length - 1];
   }
+
+  /** Get full history for a token */
+  getHistory(token: string): SentimentScore[] {
+    return this.sentimentHistory.get(token.toUpperCase()) ?? [];
+  }
+
+  /** Clear caches (useful for testing) */
+  reset(): void {
+    this.tweetCache.clear();
+    this.sentimentHistory.clear();
+  }
 }
 
-// Standalone analysis for quick testing
+// ── Standalone test ──────────────────────────────────────────────────
+
 if (require.main === module) {
   const analyzer = new SentimentAnalyzer();
-  
-  // Test with sample tweets
+
   const sampleTweets: Tweet[] = [
     {
       id: '1',
       text: '$SOL looking bullish af 🚀 breaking out of this channel, could moon soon',
-      author: 'cryptotrader',
-      authorFollowers: 50000,
-      timestamp: new Date(),
-      likes: 500,
-      retweets: 100,
-      replies: 50,
-      tokens: []
+      author: 'cryptotrader', authorFollowers: 50000,
+      timestamp: new Date(), likes: 500, retweets: 100, replies: 50, tokens: [],
     },
     {
-      id: '2', 
+      id: '2',
       text: 'Just aped into $BONK, this is the play. wagmi 🔥',
-      author: 'degen123',
-      authorFollowers: 10000,
-      timestamp: new Date(),
-      likes: 200,
-      retweets: 50,
-      replies: 30,
-      tokens: []
+      author: 'degen123', authorFollowers: 10000,
+      timestamp: new Date(), likes: 200, retweets: 50, replies: 30, tokens: [],
     },
     {
       id: '3',
       text: '$JUP looking like a scam tbh, devs dumping on retail. bearish 📉',
-      author: 'skeptic_whale',
-      authorFollowers: 100000,
-      timestamp: new Date(),
-      likes: 1000,
-      retweets: 200,
-      replies: 150,
-      tokens: []
-    }
+      author: 'skeptic_whale', authorFollowers: 100000,
+      timestamp: new Date(), likes: 1000, retweets: 200, replies: 150, tokens: [],
+    },
+    {
+      id: '4',
+      text: "I don't think $SOL is bullish at all right now, not buying this pump",
+      author: 'contrarian', authorFollowers: 30000,
+      timestamp: new Date(), likes: 80, retweets: 10, replies: 5, tokens: [],
+    },
   ];
-  
+
   const results = analyzer.processTweets(sampleTweets);
-  
+
   console.log('\n📊 Sentiment Analysis Results:\n');
   for (const [token, sentiment] of results) {
     const emoji = sentiment.score > 20 ? '🟢' : sentiment.score < -20 ? '🔴' : '🟡';
     console.log(`${emoji} ${token}: ${sentiment.score > 0 ? '+' : ''}${sentiment.score} (confidence: ${sentiment.confidence}%, volume: ${sentiment.volume})`);
+    if (sentiment.signals) {
+      console.log(`   signals: keyword=${sentiment.signals.keywordScore} emoji=${sentiment.signals.emojiScore} virality=${sentiment.signals.viralityBonus}`);
+    }
   }
-  
+
   console.log('\n📈 Trending:\n');
   const trending = analyzer.getTrending(5);
   for (const t of trending) {
